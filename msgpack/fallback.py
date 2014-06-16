@@ -162,15 +162,8 @@ class Unpacker(object):
                 raise TypeError("`file_like.read` must be callable")
             self.file_like = file_like
             self._fb_feeding = False
-        self._fb_buffers = []
+        self._fb_buffer = bytearray()
         self._fb_buf_o = 0
-        self._fb_buf_i = 0
-        self._fb_buf_n = 0
-        # When Unpacker is used as an iterable, between the calls to next(),
-        # the buffer is not "consumed" completely, for efficiency sake.
-        # Instead, it is done sloppily.  To make sure we raise BufferFull at
-        # the correct moments, we have to keep track of how sloppy we were.
-        self._fb_sloppiness = 0
         self._max_buffer_size = max_buffer_size or 2**31-1
         if read_size > self._max_buffer_size:
             raise ValueError("read_size must be smaller than max_buffer_size")
@@ -196,46 +189,21 @@ class Unpacker(object):
             raise TypeError("`ext_hook` is not callable")
 
     def feed(self, next_bytes):
+        assert self._fb_feeding
         if isinstance(next_bytes, array.array):
             next_bytes = next_bytes.tostring()
-        elif isinstance(next_bytes, bytearray):
-            next_bytes = bytes(next_bytes)
-        assert self._fb_feeding
-        if (self._fb_buf_n + len(next_bytes) - self._fb_sloppiness
-                        > self._max_buffer_size):
+        if (len(self._fb_buffer) + len(next_bytes) > self._max_buffer_size):
             raise BufferFull
-        self._fb_buf_n += len(next_bytes)
-        self._fb_buffers.append(next_bytes)
-
-    def _fb_sloppy_consume(self):
-        """ Gets rid of some of the used parts of the buffer. """
-        if self._fb_buf_i:
-            for i in xrange(self._fb_buf_i):
-                self._fb_buf_n -=  len(self._fb_buffers[i])
-            self._fb_buffers = self._fb_buffers[self._fb_buf_i:]
-            self._fb_buf_i = 0
-        if self._fb_buffers:
-            self._fb_sloppiness = self._fb_buf_o
-        else:
-            self._fb_sloppiness = 0
+        self._fb_buffer.extend(next_bytes)
 
     def _fb_consume(self):
         """ Gets rid of the used parts of the buffer. """
-        if self._fb_buf_i:
-            for i in xrange(self._fb_buf_i):
-                self._fb_buf_n -=  len(self._fb_buffers[i])
-            self._fb_buffers = self._fb_buffers[self._fb_buf_i:]
-            self._fb_buf_i = 0
-        if self._fb_buffers:
-            self._fb_buffers[0] = self._fb_buffers[0][self._fb_buf_o:]
-            self._fb_buf_n -= self._fb_buf_o
-        else:
-            self._fb_buf_n = 0
-        self._fb_buf_o = 0
-        self._fb_sloppiness = 0
+        if self._fb_buf_o:
+            self._fb_buffer = self._fb_buffer[self._fb_buf_o:]
+            self._fb_buf_o = 0
 
     def _fb_got_extradata(self):
-        if self._fb_buf_i != len(self._fb_buffers):
+        if self._fb_buf_o < len(self._fb_buffer):
             return True
         if self._fb_feeding:
             return False
@@ -252,30 +220,25 @@ class Unpacker(object):
         return self._fb_read(n)
 
     def _fb_rollback(self):
-        self._fb_buf_i = 0
         self._fb_buf_o = 0
 
     def _fb_get_extradata(self):
-        bufs = self._fb_buffers[self._fb_buf_i:]
-        if bufs:
-            bufs[0] = bufs[0][self._fb_buf_o:]
-        return b''.join(bufs)
+        return bytes(self._fb_buffer[self._fb_buf_o:])
 
     def _fb_read(self, n, write_bytes=None):
-        buffs = self._fb_buffers
+        buf = self._fb_buffer
         # We have a redundant codepath for the most common case, such that
         # pypy optimizes it properly.  This is the case that the read fits
         # in the current buffer.
-        if (write_bytes is None and self._fb_buf_i < len(buffs) and
-                self._fb_buf_o + n < len(buffs[self._fb_buf_i])):
+        if (write_bytes is None and self._fb_buf_o + n < len(buf)):
             self._fb_buf_o += n
-            return buffs[self._fb_buf_i][self._fb_buf_o - n:self._fb_buf_o]
+            return bytes(buf[self._fb_buf_o - n:self._fb_buf_o])
 
         # The remaining cases.
         ret = b''
         while len(ret) != n:
             sliced = n - len(ret)
-            if self._fb_buf_i == len(buffs):
+            if self._fb_buf_o == len(buf):
                 if self._fb_feeding:
                     break
                 to_read = sliced
@@ -284,14 +247,11 @@ class Unpacker(object):
                 tmp = self.file_like.read(to_read)
                 if not tmp:
                     break
-                buffs.append(tmp)
-                self._fb_buf_n += len(tmp)
+                buf.extend(tmp)
                 continue
-            ret += buffs[self._fb_buf_i][self._fb_buf_o:self._fb_buf_o + sliced]
-            self._fb_buf_o += sliced
-            if self._fb_buf_o >= len(buffs[self._fb_buf_i]):
-                self._fb_buf_o = 0
-                self._fb_buf_i += 1
+            remaining = min(sliced, len(buf) - self._fb_buf_o)
+            ret += bytes(buf[self._fb_buf_o:self._fb_buf_o+remaining])
+            self._fb_buf_o += remaining
         if len(ret) != n:
             self._fb_rollback()
             raise OutOfData
@@ -473,7 +433,7 @@ class Unpacker(object):
     def next(self):
         try:
             ret = self._fb_unpack(EX_CONSTRUCT, None)
-            self._fb_sloppy_consume()
+            self._fb_consume()
             return ret
         except OutOfData:
             self._fb_consume()
